@@ -114,7 +114,7 @@
 
     <httpclient.version>4.5.14</httpclient.version>
     <!-- Upgrading to spring version 6.x requires Java 17 -->
-    <spring.version>6.1.12</spring.version>
+    <spring.version>6.1.14</spring.version>
     <log4j.version>2.21.0</log4j.version>
     <!-- Upgrading jupiter version causes test failures -->
     <org.junit.jupiter.version>5.9.3</org.junit.jupiter.version>
