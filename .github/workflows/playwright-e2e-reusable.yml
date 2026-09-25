@@ -1,0 +1,349 @@
+#  Copyright 2024 Collate
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#  http://www.apache.org/licenses/LICENSE-2.0
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+# Single implementation of the Playwright E2E pipeline, called by the MySQL /
+# PostgreSQL PR workflows and the nightly workflow. See
+# openmetadata-ui/src/main/resources/ui/playwright/README.md -> "CI pipeline".
+#
+#   gate ──► e2e (N shards) ──► report (merged HTML + flaky summary)
+#
+# Per shard, one step runs up to three Playwright invocations:
+#   1. main          – parallel suite, sharded, retries on (flakes reported)
+#   2. global-state  – @global-state tests, shard 1 only, --workers=1
+#   3. burn-in       – specs changed in the PR, shard 1 only, --repeat-each=3
+#                      --retries=0, so a new flaky test can never merge
+
+name: Playwright E2E (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      database:
+        description: "mysql | postgresql"
+        type: string
+        required: true
+      shard-total:
+        type: number
+        default: 4
+      run-quarantine:
+        description: "Run only @quarantine tests (nightly burn-in)"
+        type: boolean
+        default: false
+      repeat-each:
+        type: number
+        default: 1
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  UI_DIR: openmetadata-ui/src/main/resources/ui
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.list }}
+    steps:
+      - name: Wait for the labeler
+        uses: lewagon/wait-on-check-action@v1.3.3
+        if: ${{ github.event_name == 'pull_request_target' }}
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          check-name: Team Label
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 90
+
+      - name: Verify PR labels
+        uses: jesusvasquez333/verify-pr-label-action@v1.4.0
+        if: ${{ github.event_name == 'pull_request_target' }}
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          valid-labels: "safe to test"
+          pull-request-number: "${{ github.event.pull_request.number }}"
+          disable-reviews: true # To not auto approve changes
+
+      - name: Compute shard matrix
+        id: shards
+        run: echo "list=$(seq -s, 1 ${{ inputs.shard-total }} | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: test
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shardIndex: ${{ fromJSON(needs.gate.outputs.shards) }}
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+          docker-images: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Cache Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Setup Openmetadata Test Environment
+        uses: ./.github/actions/setup-openmetadata-test-environment
+        with:
+          python-version: '3.9'
+          args: "-d ${{ inputs.database }}"
+          ingestion_dependency: "all"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ env.UI_DIR }}/.nvmrc
+          cache: yarn
+          cache-dependency-path: ${{ env.UI_DIR }}/yarn.lock
+
+      - name: Install dependencies
+        working-directory: ${{ env.UI_DIR }}
+        run: yarn --frozen-lockfile
+
+      # Use the exact Playwright version from yarn.lock for browsers too.
+      - name: Resolve Playwright version
+        id: pw
+        working-directory: ${{ env.UI_DIR }}
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pw.outputs.version }}
+
+      - name: Install Playwright Chromium
+        working-directory: ${{ env.UI_DIR }}
+        run: |
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            npx playwright install-deps chromium
+          else
+            npx playwright install --with-deps chromium
+          fi
+
+      - name: Find specs changed in this PR (burn-in)
+        id: changed
+        if: ${{ matrix.shardIndex == 1 && github.event_name == 'pull_request_target' && !inputs.run-quarantine }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" \
+            --jq '.[] | select(.status != "removed") | .filename' \
+            | grep -E '^openmetadata-ui/src/main/resources/ui/playwright/e2e/.*\.spec\.ts$' \
+            | sed "s#^$UI_DIR/##" | tr '\n' ' ' || true)
+          echo "Changed specs: ${files:-<none>}"
+          echo "specs=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Run Playwright tests
+        working-directory: ${{ env.UI_DIR }}
+        env:
+          SHARD: ${{ matrix.shardIndex }}/${{ inputs.shard-total }}
+          IS_FIRST_SHARD: ${{ matrix.shardIndex == 1 }}
+          REPEAT_EACH: ${{ inputs.repeat-each }}
+          CHANGED_SPECS: ${{ steps.changed.outputs.specs }}
+          PLAYWRIGHT_RUN_QUARANTINE: ${{ inputs.run-quarantine }}
+          # Quarantine burn-in must see every failure, so no retries there.
+          PLAYWRIGHT_RETRIES: ${{ inputs.run-quarantine && '0' || '' }}
+          PLAYWRIGHT_IS_OSS: true
+          PLAYWRIGHT_SNOWFLAKE_USERNAME: ${{ secrets.TEST_SNOWFLAKE_USERNAME }}
+          PLAYWRIGHT_SNOWFLAKE_PASSWORD: ${{ secrets.TEST_SNOWFLAKE_PASSWORD }}
+          PLAYWRIGHT_SNOWFLAKE_ACCOUNT: ${{ secrets.TEST_SNOWFLAKE_ACCOUNT }}
+          PLAYWRIGHT_SNOWFLAKE_DATABASE: ${{ secrets.TEST_SNOWFLAKE_DATABASE }}
+          PLAYWRIGHT_SNOWFLAKE_WAREHOUSE: ${{ secrets.TEST_SNOWFLAKE_WAREHOUSE }}
+          PLAYWRIGHT_BQ_PRIVATE_KEY: ${{ secrets.TEST_BQ_PRIVATE_KEY }}
+          PLAYWRIGHT_BQ_PROJECT_ID: ${{ secrets.TEST_BQ_PROJECT_ID }}
+          PLAYWRIGHT_BQ_PRIVATE_KEY_ID: ${{ secrets.TEST_BQ_PRIVATE_KEY_ID }}
+          PLAYWRIGHT_BQ_PROJECT_ID_TAXONOMY: ${{ secrets.TEST_BQ_PROJECT_ID_TAXONOMY }}
+          PLAYWRIGHT_BQ_CLIENT_EMAIL: ${{ secrets.TEST_BQ_CLIENT_EMAIL }}
+          PLAYWRIGHT_BQ_CLIENT_ID: ${{ secrets.TEST_BQ_CLIENT_ID }}
+          PLAYWRIGHT_REDSHIFT_HOST: ${{ secrets.E2E_REDSHIFT_HOST_PORT }}
+          PLAYWRIGHT_REDSHIFT_USERNAME: ${{ secrets.E2E_REDSHIFT_USERNAME }}
+          PLAYWRIGHT_REDSHIFT_PASSWORD: ${{ secrets.E2E_REDSHIFT_PASSWORD }}
+          PLAYWRIGHT_REDSHIFT_DATABASE: ${{ secrets.TEST_REDSHIFT_DATABASE }}
+          PLAYWRIGHT_METABASE_USERNAME: ${{ secrets.TEST_METABASE_USERNAME }}
+          PLAYWRIGHT_METABASE_PASSWORD: ${{ secrets.TEST_METABASE_PASSWORD }}
+          PLAYWRIGHT_METABASE_DB_SERVICE_NAME: ${{ secrets.TEST_METABASE_DB_SERVICE_NAME }}
+          PLAYWRIGHT_METABASE_HOST_PORT: ${{ secrets.TEST_METABASE_HOST_PORT }}
+          PLAYWRIGHT_SUPERSET_USERNAME: ${{ secrets.TEST_SUPERSET_USERNAME }}
+          PLAYWRIGHT_SUPERSET_PASSWORD: ${{ secrets.TEST_SUPERSET_PASSWORD }}
+          PLAYWRIGHT_SUPERSET_HOST_PORT: ${{ secrets.TEST_SUPERSET_HOST_PORT }}
+          PLAYWRIGHT_KAFKA_BOOTSTRAP_SERVERS: ${{ secrets.TEST_KAFKA_BOOTSTRAP_SERVERS }}
+          PLAYWRIGHT_KAFKA_SCHEMA_REGISTRY_URL: ${{ secrets.TEST_KAFKA_SCHEMA_REGISTRY_URL }}
+          PLAYWRIGHT_GLUE_ACCESS_KEY: ${{ secrets.TEST_GLUE_ACCESS_KEY }}
+          PLAYWRIGHT_GLUE_SECRET_KEY: ${{ secrets.TEST_GLUE_SECRET_KEY }}
+          PLAYWRIGHT_GLUE_AWS_REGION: ${{ secrets.TEST_GLUE_AWS_REGION }}
+          PLAYWRIGHT_GLUE_ENDPOINT: ${{ secrets.TEST_GLUE_ENDPOINT }}
+          PLAYWRIGHT_GLUE_STORAGE_SERVICE: ${{ secrets.TEST_GLUE_STORAGE_SERVICE }}
+          PLAYWRIGHT_MYSQL_USERNAME: ${{ secrets.TEST_MYSQL_USERNAME }}
+          PLAYWRIGHT_MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          PLAYWRIGHT_MYSQL_HOST_PORT: ${{ secrets.TEST_MYSQL_HOST_PORT }}
+          PLAYWRIGHT_MYSQL_DATABASE_SCHEMA: ${{ secrets.TEST_MYSQL_DATABASE_SCHEMA }}
+          PLAYWRIGHT_POSTGRES_USERNAME: ${{ secrets.TEST_POSTGRES_USERNAME }}
+          PLAYWRIGHT_POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          PLAYWRIGHT_POSTGRES_HOST_PORT: ${{ secrets.TEST_POSTGRES_HOST_PORT }}
+          PLAYWRIGHT_POSTGRES_DATABASE: ${{ secrets.TEST_POSTGRES_DATABASE }}
+          PLAYWRIGHT_AIRFLOW_HOST_PORT: ${{ secrets.TEST_AIRFLOW_HOST_PORT }}
+          PLAYWRIGHT_ML_MODEL_TRACKING_URI: ${{ secrets.TEST_ML_MODEL_TRACKING_URI }}
+          PLAYWRIGHT_ML_MODEL_REGISTRY_URI: ${{ secrets.TEST_ML_MODEL_REGISTRY_URI }}
+          PLAYWRIGHT_S3_STORAGE_ACCESS_KEY_ID: ${{ secrets.TEST_S3_STORAGE_ACCESS_KEY_ID }}
+          PLAYWRIGHT_S3_STORAGE_SECRET_ACCESS_KEY: ${{ secrets.TEST_S3_STORAGE_SECRET_ACCESS_KEY }}
+          PLAYWRIGHT_S3_STORAGE_END_POINT_URL: ${{ secrets.TEST_S3_STORAGE_END_POINT_URL }}
+          # Lets @estruyf/github-actions-reporter determine the unique run id.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status=0
+
+          echo "::group::main suite (shard $SHARD)"
+          PLAYWRIGHT_RUN_LABEL=main npx playwright test \
+            --project=chromium --project="Data Insight" \
+            --shard="$SHARD" --repeat-each="$REPEAT_EACH" --pass-with-no-tests || status=1
+          echo "::endgroup::"
+
+          if [ "$IS_FIRST_SHARD" = "true" ]; then
+            echo "::group::global-state suite (serial)"
+            PLAYWRIGHT_RUN_LABEL=global-state npx playwright test \
+              --project=global-state --workers=1 --pass-with-no-tests || status=1
+            echo "::endgroup::"
+          fi
+
+          if [ -n "$CHANGED_SPECS" ]; then
+            echo "::group::burn-in of changed specs"
+            # shellcheck disable=SC2086
+            PLAYWRIGHT_RUN_LABEL=burn-in npx playwright test $CHANGED_SPECS \
+              --project=chromium --repeat-each=3 --retries=0 --pass-with-no-tests || {
+                echo "::error::Changed spec(s) are not stable under --repeat-each=3. Fix the flakiness before merging."
+                status=1
+              }
+            echo "::endgroup::"
+          fi
+
+          exit $status
+
+      - name: Collect blob reports
+        if: ${{ !cancelled() }}
+        working-directory: ${{ env.UI_DIR }}/playwright/output
+        run: |
+          mkdir -p blob-upload
+          # Burn-in repeats are excluded from the merged report on purpose.
+          for label in main global-state; do
+            for f in blob-report/$label/*.zip; do
+              [ -e "$f" ] && cp "$f" "blob-upload/$label-${{ matrix.shardIndex }}-$(basename "$f")"
+            done
+          done
+          ls -la blob-upload
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: blob-report-${{ inputs.database }}-${{ matrix.shardIndex }}
+          path: ${{ env.UI_DIR }}/playwright/output/blob-upload
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: flaky-${{ inputs.database }}-${{ matrix.shardIndex }}
+          path: ${{ env.UI_DIR }}/playwright/output/flaky
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Traces / videos / screenshots of failures and retries only.
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: test-results-${{ inputs.database }}-${{ matrix.shardIndex }}
+          path: ${{ env.UI_DIR }}/playwright/output/test-results
+          retention-days: 7
+
+      - name: Clean Up
+        if: ${{ always() }}
+        run: |
+          cd ./docker/development
+          docker compose down --remove-orphans
+          sudo rm -rf ${PWD}/docker-volume
+
+  report:
+    needs: e2e
+    if: ${{ !cancelled() && needs.e2e.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: ${{ env.UI_DIR }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ env.UI_DIR }}/.nvmrc
+          cache: yarn
+          cache-dependency-path: ${{ env.UI_DIR }}/yarn.lock
+
+      - name: Install dependencies
+        working-directory: ${{ env.UI_DIR }}
+        run: yarn --frozen-lockfile --ignore-scripts
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: blob-report-${{ inputs.database }}-*
+          path: ${{ env.UI_DIR }}/all-blob-reports
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flaky-${{ inputs.database }}-*
+          path: ${{ env.UI_DIR }}/all-flaky
+          merge-multiple: false
+
+      - name: Merge into one HTML report
+        working-directory: ${{ env.UI_DIR }}
+        run: npx playwright merge-reports --reporter html ./all-blob-reports
+
+      - name: Flaky test summary
+        working-directory: ${{ env.UI_DIR }}
+        run: |
+          count=$(cat all-flaky/*/*.json 2>/dev/null | jq -s '[.[].flaky[]] | length' || echo 0)
+          echo "## Playwright (${{ inputs.database }}): ${count:-0} flaky test(s)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${count:-0}" != "0" ]; then
+            echo "| Test | Location |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            cat all-flaky/*/*.json | jq -rs '[.[].flaky[]] | unique_by(.title)[] | "| \(.title) | \(.file | split("/playwright/") | last):\(.line) |"' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ inputs.database }}
+          path: ${{ env.UI_DIR }}/playwright-report
+          retention-days: 14

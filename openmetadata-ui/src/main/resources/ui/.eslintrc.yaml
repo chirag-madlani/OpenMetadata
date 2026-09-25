@@ -242,6 +242,52 @@ overrides:
         - off
       jest/no-conditional-expect:
         - off
+      # Flakiness guardrails. `warn` while legacy specs are migrated; the
+      # override below makes them errors for the new fixture/infra layer.
+      # Rationale for each rule: playwright/README.md -> "Banned patterns".
+      no-restricted-syntax:
+        - warn
+        - &pwNoHardWait
+          selector: CallExpression[callee.property.name='waitForTimeout']
+          message: Hard waits are banned. Wait for a UI state (expect(locator)...) or a response (utils/wait.ts).
+        - &pwNoDiscardedState
+          selector: ExpressionStatement > AwaitExpression > CallExpression[callee.property.name=/^(isVisible|isHidden|isEnabled|isDisabled|isChecked|isEditable)$/]
+          message: The result is discarded, so this asserts nothing. Use `await expect(locator).toBeVisible()` (or toBeEnabled, toBeChecked, ...).
+        - &pwNoForce
+          selector: Property[key.name='force'][value.value=true]
+          message: "`force: true` skips actionability checks and hides real bugs (overlays, disabled buttons). Wait for the blocking element to go away instead."
+        - &pwNoPageSelectorActions
+          selector: CallExpression[callee.object.name='page'][callee.property.name=/^(click|dblclick|fill|type|hover|check|uncheck|press|selectOption|tap|focus|textContent|innerText|getAttribute|isVisible)$/]
+          message: Use locator APIs (`page.getByTestId(id).click()`); `page.<action>(selector)` is discouraged and does not auto-retry assertions.
+        - &pwNoWaitForSelector
+          selector: CallExpression[callee.property.name='waitForSelector']
+          message: Use a web-first assertion (`await expect(locator).toBeVisible()`) instead of waitForSelector.
+        - &pwNoNetworkIdle
+          selector: CallExpression[callee.property.name='waitForLoadState'] > Literal[value='networkidle']
+          message: networkidle is unreliable with polling/websockets. Wait for the specific response or element.
+        - &pwNoSerial
+          selector: MemberExpression[object.property.name='describe'][property.name='serial'], Property[key.name='mode'][value.value='serial']
+          message: Serial mode couples tests so one failure (or retry) cascades. Make each test independent with fixtures.
+        - &pwNoOnly
+          selector: MemberExpression[object.name='test'][property.name='only'], MemberExpression[object.property.name='describe'][property.name='only']
+          message: Remove `.only` before committing.
+
+  - files:
+      - playwright/fixtures/**
+      - playwright/config/**
+      - playwright/reporters/**
+      - playwright/utils/wait.ts
+    rules:
+      no-restricted-syntax:
+        - error
+        - *pwNoHardWait
+        - *pwNoDiscardedState
+        - *pwNoForce
+        - *pwNoPageSelectorActions
+        - *pwNoWaitForSelector
+        - *pwNoNetworkIdle
+        - *pwNoSerial
+        - *pwNoOnly
 
   # i18next rule is not required for js, jsx, json and test file
   - files:

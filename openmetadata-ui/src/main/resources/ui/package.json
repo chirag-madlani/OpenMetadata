@@ -38,7 +38,11 @@
     "check-i18n": "npm run i18n -- --check",
     "playwright:run": "playwright test",
     "playwright:open": "playwright test --ui",
-    "playwright:codegen": "playwright codegen"
+    "playwright:codegen": "playwright codegen",
+    "playwright:smoke": "playwright test --project=chromium --grep @smoke",
+    "playwright:burn-in": "playwright test --project=chromium --repeat-each=5 --retries=0",
+    "playwright:quarantine": "PLAYWRIGHT_RUN_QUARANTINE=true playwright test --retries=0",
+    "playwright:report": "playwright show-report playwright/output/playwright-report"
   },
   "dependencies": {
     "@analytics/session-utils": "^0.1.17",

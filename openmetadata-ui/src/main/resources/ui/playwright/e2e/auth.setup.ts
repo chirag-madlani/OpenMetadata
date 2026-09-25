@@ -10,13 +10,33 @@
  *  See the License for the specific language governing permissions and
  *  limitations under the License.
  */
-import { test as setup } from '@playwright/test';
+import { expect, request, test as setup } from '@playwright/test';
+import { AUTH_STATE, ENV } from '../config/env';
 import { JWT_EXPIRY_TIME_MAP } from '../constant/login';
 import { AdminClass } from '../support/user/AdminClass';
 import { getApiContext } from '../utils/common';
 import { updateJWTTokenExpiryTime } from '../utils/login';
 import { removeOrganizationPolicyAndRole } from '../utils/team';
-const adminFile = 'playwright/.auth/admin.json';
+const adminFile = AUTH_STATE.admin;
+
+// Health check must pass before authentication is attempted.
+setup.describe.configure({ mode: 'serial' });
+
+// Fail fast with one clear message when the server is not ready, instead of
+// hundreds of confusing UI timeouts across every shard.
+setup('OpenMetadata server is healthy', async () => {
+  setup.setTimeout(180_000);
+  const api = await request.newContext({ baseURL: ENV.baseURL });
+  try {
+    await expect(async () => {
+      const response = await api.get('/api/v1/system/version');
+
+      expect(response.status(), 'GET /api/v1/system/version').toBe(200);
+    }).toPass({ timeout: 120_000, intervals: [2_000, 5_000, 10_000] });
+  } finally {
+    await api.dispose();
+  }
+});
 
 setup('authenticate as admin', async ({ page }) => {
   const admin = new AdminClass();

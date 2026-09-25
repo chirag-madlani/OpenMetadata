@@ -10,87 +10,137 @@
  *  See the License for the specific language governing permissions and
  *  limitations under the License.
  */
-import { defineConfig, devices } from '@playwright/test';
-import dotenv from 'dotenv';
+import {
+  defineConfig,
+  devices,
+  Project,
+  ReporterDescription,
+} from '@playwright/test';
+// Loads `.env` itself, so every knob is read from one place.
+import { ENV, TAGS } from './playwright/config/env';
+
+const OUTPUT_DIR = './playwright/output';
+
+const reporters: ReporterDescription[] = ENV.isCI
+  ? [
+      ['list'],
+      // Per-shard blob, merged into one HTML report by the CI merge job.
+      ['blob', { outputDir: `${OUTPUT_DIR}/blob-report/${ENV.runLabel}` }],
+      [
+        'html',
+        { outputFolder: `${OUTPUT_DIR}/playwright-report`, open: 'never' },
+      ],
+      ['junit', { outputFile: `${OUTPUT_DIR}/junit/results.xml` }],
+      [
+        '@estruyf/github-actions-reporter',
+        { useDetails: true, showError: true },
+      ],
+      [
+        './playwright/reporters/flaky-reporter.ts',
+        { outputFile: `${OUTPUT_DIR}/flaky/${ENV.runLabel}.json` },
+      ],
+    ]
+  : [
+      ['list'],
+      [
+        'html',
+        { outputFolder: `${OUTPUT_DIR}/playwright-report`, open: 'never' },
+      ],
+      [
+        './playwright/reporters/flaky-reporter.ts',
+        { outputFile: `${OUTPUT_DIR}/flaky/${ENV.runLabel}.json` },
+      ],
+    ];
 
 /**
- * Read environment variables from file.
- * https://github.com/motdotla/dotenv
+ * Blocking runs exclude quarantined tests; the nightly burn-in job runs only
+ * them (`PLAYWRIGHT_RUN_QUARANTINE=true`) to decide when they can come back.
  */
-dotenv.config();
+const quarantine = new RegExp(TAGS.quarantine);
+const globalState = new RegExp(TAGS.globalState);
+const asArray = (value?: RegExp | RegExp[]) =>
+  value === undefined ? [] : Array.isArray(value) ? value : [value];
 
-/**
- * See https://playwright.dev/docs/test-configuration.
- */
+const withQuarantine = (project: Project): Project => {
+  if (!ENV.runQuarantine) {
+    return {
+      ...project,
+      grepInvert: [...asArray(project.grepInvert), quarantine],
+    };
+  }
+  // AND the project's own `grep` with the quarantine tag via lookaheads.
+  const required = [...asArray(project.grep), quarantine]
+    .map((re) => `(?=.*${re.source})`)
+    .join('');
+
+  return { ...project, grep: new RegExp(`^${required}`) };
+};
+
 export default defineConfig({
   testDir: './playwright/e2e',
-  outputDir: './playwright/output/test-results',
-  /* Run tests in files in parallel */
-  fullyParallel: true,
-  /* Fail the build on CI if you accidentally left test.only in the source code. */
-  forbidOnly: !!process.env.CI,
-  /* Retry on CI only */
-  retries: process.env.CI ? 1 : 0,
-  /* Opt out of parallel tests on CI. */
-  workers: process.env.CI ? 3 : undefined,
-  maxFailures: 30,
-  /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: [
-    ['list'],
-    ['html', { outputFolder: './playwright/output/playwright-report' }],
-    [
-      '@estruyf/github-actions-reporter',
-      {
-        useDetails: true,
-        showError: true,
-      },
-    ],
-  ],
-  /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
-  use: {
-    /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: process.env.PLAYWRIGHT_TEST_BASE_URL || 'http://localhost:8585',
+  outputDir: `${OUTPUT_DIR}/test-results/${ENV.runLabel}`,
 
-    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
-    trace: 'on-first-retry',
-    /* Screenshot on failure. */
+  fullyParallel: true,
+  forbidOnly: ENV.isCI,
+  retries: ENV.retries,
+  workers: ENV.workers,
+  // Stop burning CI minutes once the run is clearly broken (e.g. server down).
+  maxFailures: ENV.isCI ? 30 : undefined,
+
+  timeout: ENV.timeouts.test,
+  expect: { timeout: ENV.timeouts.expect },
+  reportSlowTests: { max: 10, threshold: 120_000 },
+  reporter: reporters,
+
+  use: {
+    baseURL: ENV.baseURL,
+    testIdAttribute: 'data-testid',
+    actionTimeout: ENV.timeouts.action,
+    navigationTimeout: ENV.timeouts.navigation,
+
+    // Deterministic rendering of dates / numbers across dev machines and CI.
+    locale: 'en-US',
+    timezoneId: 'UTC',
+
+    // Artifacts: always available for a failure, cheap for a green run.
+    trace: ENV.isCI ? 'on-first-retry' : 'retain-on-failure',
     screenshot: 'only-on-failure',
+    video: ENV.isCI ? 'on-first-retry' : 'off',
   },
 
-  /* Configure projects for major browsers */
   projects: [
-    // Admin authentication setup doc: https://playwright.dev/docs/auth#multiple-signed-in-roles
+    // Health check + admin auth. Doc: https://playwright.dev/docs/auth
     {
       name: 'setup',
       testMatch: '**/*.setup.ts',
+      retries: 2,
     },
-    {
+    withQuarantine({
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
-      // Added admin setup as a dependency. This will authorize the page with an admin user before running the test. doc: https://playwright.dev/docs/auth#multiple-signed-in-roles
       dependencies: ['setup'],
-      grepInvert: /data-insight/,
-    },
+      grepInvert: [/data-insight/, globalState],
+    }),
+    // Tests that mutate instance-wide settings (theme, login config, landing
+    // page, ...). CI runs this project in a separate `--workers=1` step so
+    // they cannot interfere with each other or with the parallel suite.
+    withQuarantine({
+      name: 'global-state',
+      use: { ...devices['Desktop Chrome'] },
+      dependencies: ['setup'],
+      grep: globalState,
+      fullyParallel: false,
+    }),
     {
       name: 'data-insight-application',
       dependencies: ['setup'],
       testMatch: '**/dataInsightApp.ts',
     },
-    {
+    withQuarantine({
       name: 'Data Insight',
       use: { ...devices['Desktop Chrome'] },
       dependencies: ['data-insight-application'],
       grep: /data-insight/,
-    },
+    }),
   ],
-
-  // Increase timeout for the test
-  timeout: 60000,
-
-  /* Run your local dev server before starting the tests */
-  // webServer: {
-  //   command: 'npm run start',
-  //   url: 'http://127.0.0.1:3000',
-  //   reuseExistingServer: !process.env.CI,
-  // },
 });
